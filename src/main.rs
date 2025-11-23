@@ -1,12 +1,12 @@
 
 
-mod  kv_store;
+use key_value_store::KvStore;
 
 fn main() -> std::io::Result<()>{
 
       let path = "kv_store.data";
     
-    let mut store = kv_store::KvStore::open(path)?;
+    let mut store = KvStore::open(path)?;
 
     // store.put("name", b"Furkan")?;
     // store.put("lang", b"Rust")?;

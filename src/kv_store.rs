@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-
 pub struct KvStore {
-    file: File,
+    writer: BufWriter<File>,
+    reader: File,
     index: HashMap<String, u64>, 
 }
 
@@ -18,8 +18,12 @@ impl KvStore {
             .append(true) 
             .open(path)?;
 
+        let reader = file.try_clone()?;
+        let writer = BufWriter::new(file);
+
         let mut store = KvStore {
-            file,
+            writer,
+            reader,
             index: HashMap::new(),
         };
 
@@ -28,17 +32,18 @@ impl KvStore {
     }
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> io::Result<u64> {
-        let offset = self.file.seek(SeekFrom::End(0))?;
+        // Get current position from the writer (logical position)
+        let offset = self.writer.stream_position()?;
 
         // header: [u32 key_len][u32 value_len] (little-endian)
         let klen = key.len() as u32;
         let vlen = value.len() as u32;
 
-        self.file.write_all(&klen.to_le_bytes())?;
-        self.file.write_all(&vlen.to_le_bytes())?;
-        self.file.write_all(key.as_bytes())?;
-        self.file.write_all(value)?;
-        self.file.flush()?; 
+        self.writer.write_all(&klen.to_le_bytes())?;
+        self.writer.write_all(&vlen.to_le_bytes())?;
+        self.writer.write_all(key.as_bytes())?;
+        self.writer.write_all(value)?;
+        // No flush here!
 
         self.index.insert(key.to_string(), offset);
 
@@ -52,19 +57,22 @@ impl KvStore {
             None => return Ok(None),
         };
 
-        // Seek to the record header
-        self.file.seek(SeekFrom::Start(offset))?;
+        // Flush writer to ensure data is on disk before reading
+        self.writer.flush()?;
+
+        // Seek to the record header using the reader
+        self.reader.seek(SeekFrom::Start(offset))?;
 
         // Read header
         let mut buf4 = [0u8; 4];
-        self.file.read_exact(&mut buf4)?;
+        self.reader.read_exact(&mut buf4)?;
         let klen = u32::from_le_bytes(buf4) as usize;
 
-        self.file.read_exact(&mut buf4)?;
+        self.reader.read_exact(&mut buf4)?;
         let vlen = u32::from_le_bytes(buf4) as usize;
 
         let mut key_buf = vec![0u8; klen];
-        self.file.read_exact(&mut key_buf)?;
+        self.reader.read_exact(&mut key_buf)?;
         let key_read = String::from_utf8_lossy(&key_buf);
 
         if key_read != key {
@@ -76,13 +84,13 @@ impl KvStore {
 
         // Read value bytes
         let mut value_buf = vec![0u8; vlen];
-        self.file.read_exact(&mut value_buf)?;
+        self.reader.read_exact(&mut value_buf)?;
         Ok(Some(value_buf))
     }
 
     fn load_index(&mut self) -> io::Result<()> {
-        // file.try_clone() is cheap (dup underlying fd).
-        let mut rdr = BufReader::new(self.file.try_clone()?);
+        // Use a buffered reader on a clone of the reader handle
+        let mut rdr = BufReader::new(self.reader.try_clone()?);
         let mut offset: u64 = 0;
 
         loop {
