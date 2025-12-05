@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::FileExt;
 use std::path::Path;
+use std::sync::Mutex;
 
 pub struct KvStore {
-    writer: BufWriter<File>,
+    writer: Mutex<BufWriter<File>>,
     reader: File,
     index: HashMap<String, u64>, 
 }
@@ -19,7 +21,7 @@ impl KvStore {
             .open(path)?;
 
         let reader = file.try_clone()?;
-        let writer = BufWriter::new(file);
+        let writer = Mutex::new(BufWriter::new(file));
 
         let mut store = KvStore {
             writer,
@@ -32,17 +34,18 @@ impl KvStore {
     }
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> io::Result<u64> {
+        let mut writer = self.writer.lock().unwrap();
         // Get current position from the writer (logical position)
-        let offset = self.writer.stream_position()?;
+        let offset = writer.stream_position()?;
 
         // header: [u32 key_len][u32 value_len] (little-endian)
         let klen = key.len() as u32;
         let vlen = value.len() as u32;
 
-        self.writer.write_all(&klen.to_le_bytes())?;
-        self.writer.write_all(&vlen.to_le_bytes())?;
-        self.writer.write_all(key.as_bytes())?;
-        self.writer.write_all(value)?;
+        writer.write_all(&klen.to_le_bytes())?;
+        writer.write_all(&vlen.to_le_bytes())?;
+        writer.write_all(key.as_bytes())?;
+        writer.write_all(value)?;
         // No flush here!
 
         self.index.insert(key.to_string(), offset);
@@ -51,29 +54,36 @@ impl KvStore {
     }
 
     /// Get value by key. Uses in-memory index to seek directly to the record.
-    pub fn get(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+    /// Takes &self to allow concurrent reads.
+    pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         let &offset = match self.index.get(key) {
             Some(off) => off,
             None => return Ok(None),
         };
 
-        // Flush writer to ensure data is on disk before reading
-        self.writer.flush()?;
+        // Flush writer to ensure data is on disk before reading.
+        // We lock specifically for this operation to ensure read-your-writes consistency.
+        {
+            let mut writer = self.writer.lock().unwrap();
+            writer.flush()?;
+        }
 
-        // Seek to the record header using the reader
-        self.reader.seek(SeekFrom::Start(offset))?;
-
-        // Read header
+        // Read header without seeking (stateless read)
         let mut buf4 = [0u8; 4];
-        self.reader.read_exact(&mut buf4)?;
-        let klen = u32::from_le_bytes(buf4) as usize;
+        let mut current_offset = offset;
 
-        self.reader.read_exact(&mut buf4)?;
+        self.read_exact_at(&mut buf4, current_offset)?;
+        let klen = u32::from_le_bytes(buf4) as usize;
+        current_offset += 4;
+
+        self.read_exact_at(&mut buf4, current_offset)?;
         let vlen = u32::from_le_bytes(buf4) as usize;
+        current_offset += 4;
 
         let mut key_buf = vec![0u8; klen];
-        self.reader.read_exact(&mut key_buf)?;
+        self.read_exact_at(&mut key_buf, current_offset)?;
         let key_read = String::from_utf8_lossy(&key_buf);
+        current_offset += klen as u64;
 
         if key_read != key {
             return Err(io::Error::new(
@@ -84,8 +94,29 @@ impl KvStore {
 
         // Read value bytes
         let mut value_buf = vec![0u8; vlen];
-        self.reader.read_exact(&mut value_buf)?;
+        self.read_exact_at(&mut value_buf, current_offset)?;
         Ok(Some(value_buf))
+    }
+
+    // Helper to read exact bytes at an offset using FileExt
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.reader.seek_read(buf, offset) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let tmp = buf;
+                    buf = &mut tmp[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !buf.is_empty() {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"))
+        } else {
+            Ok(())
+        }
     }
 
     fn load_index(&mut self) -> io::Result<()> {
